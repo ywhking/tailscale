@@ -1,0 +1,129 @@
+# DERP server Dockerfile — multi-stage build
+# Build context: tailscale/ source root
+#
+# Build for dev mode (plain HTTP on :3340):
+#   docker build -t mynet/derper:v1 -f Dockerfile.derper .
+#
+
+FROM golang:1.26-alpine AS build-env
+
+WORKDIR /go/src/tailscale
+
+# Download module dependencies first for layer caching
+COPY go.mod go.sum ./
+ENV GOPROXY=https://goproxy.cn,direct
+RUN go mod download
+
+# Pre-populate commonly used deps for faster rebuilds
+RUN go install \
+    github.com/aws/aws-sdk-go-v2/aws \
+    github.com/aws/aws-sdk-go-v2/config \
+    gvisor.dev/gvisor/pkg/tcpip/adapters/gonet \
+    gvisor.dev/gvisor/pkg/tcpip/stack \
+    golang.org/x/crypto/ssh \
+    golang.org/x/crypto/acme \
+    github.com/coder/websocket \
+    github.com/mdlayher/netlink
+
+COPY . .
+
+ARG VERSION_LONG=""
+ARG VERSION_SHORT=""
+ARG VERSION_GIT_HASH=""
+ARG TARGETARCH
+
+RUN GOARCH=$TARGETARCH go build -ldflags="\
+      -X tailscale.com/version.longStamp=$VERSION_LONG \
+      -X tailscale.com/version.shortStamp=$VERSION_SHORT \
+      -X tailscale.com/version.gitCommitStamp=$VERSION_GIT_HASH" \
+      -o /go/bin/derper -v ./cmd/derper
+
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates wget
+
+COPY --from=build-env /go/bin/derper /usr/local/bin/derper
+
+# Runtime configuration via environment variables
+# DERP_HOSTNAME:  TLS hostname for Let's Encrypt cert (required for certmode=letsencrypt)
+# DERP_CERTMODE:  "letsencrypt", "manual", or empty for HTTP-only dev mode
+# DERP_ADDR:      listen address, default depends on certmode
+# DERP_HTTP_PORT: HTTP port for ACME challenges, default 80
+# DERP_STUN_PORT: STUN UDP port, default 3478
+# DERP_HOME:      homepage behaviour: "" (default), "blank", or a redirect URL
+
+ENV DERP_HOSTNAME=""
+ENV DERP_CERTMODE=""
+ENV DERP_ADDR=""
+ENV DERP_HTTP_PORT=""
+ENV DERP_STUN_PORT="3478"
+ENV DERP_CERTDIR="/var/lib/derper/certs"
+ENV DERP_CONFIG="/var/lib/derper/derper.key"
+ENV DERP_HOME=""
+ENV DERP_VERIFY_CLIENTS="false"
+
+# STUN (UDP)
+EXPOSE 3478/udp
+# HTTPS / DERP
+EXPOSE 443
+# HTTP (ACME / redirect)
+EXPOSE 80
+# Dev HTTP fallback
+EXPOSE 3340
+
+VOLUME ["/var/lib/derper"]
+
+COPY <<'ENTRY' /usr/local/bin/derper-entrypoint.sh
+#!/bin/sh
+set -e
+
+# Build args array
+set -- -c "$DERP_CONFIG" -certdir "$DERP_CERTDIR"
+
+# Determine mode
+if [ -n "$DERP_CERTMODE" ]; then
+    # TLS mode
+    if [ -z "$DERP_HOSTNAME" ]; then
+        echo "ERROR: DERP_HOSTNAME is required when DERP_CERTMODE is set"
+        exit 1
+    fi
+    set -- "$@" -hostname "$DERP_HOSTNAME" -certmode "$DERP_CERTMODE"
+    if [ -n "$DERP_ADDR" ]; then
+        set -- "$@" -a "$DERP_ADDR"
+    else
+        set -- "$@" -a ":443"
+    fi
+    if [ -n "$DERP_HTTP_PORT" ]; then
+        set -- "$@" -http-port "$DERP_HTTP_PORT"
+    else
+        set -- "$@" -http-port 80
+    fi
+elif [ -n "$DERP_ADDR" ]; then
+    # Custom address, plain HTTP
+    set -- "$@" -a "$DERP_ADDR"
+else
+    # Dev mode: plain HTTP on :3340
+    set -- "$@" -dev
+fi
+
+# STUN
+if [ -n "$DERP_STUN_PORT" ]; then
+    set -- "$@" -stun-port "$DERP_STUN_PORT"
+fi
+
+# Homepage
+if [ -n "$DERP_HOME" ]; then
+    set -- "$@" -home "$DERP_HOME"
+fi
+
+# Client verification
+if [ "$DERP_VERIFY_CLIENTS" = "true" ]; then
+    set -- "$@" -verify-clients
+fi
+
+echo "Starting derper with args: $@"
+exec /usr/local/bin/derper "$@"
+ENTRY
+
+RUN chmod +x /usr/local/bin/derper-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/derper-entrypoint.sh"]
